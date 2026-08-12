@@ -1,68 +1,311 @@
 #include <vector>
-#include <common/maca_fp16.h>
+#include <cmath>
+#include <algorithm>
+#include <cassert>
+#include <mc_runtime.h>          // 沐曦运行时 API
+#include <common/maca_fp16.h>    // half 类型定义
 
-#include "../tester/utils.h"
-
-/**
- * @brief Computes RMSNorm over the last dimension of a 2D tensor.
- *
- * The input is a row-major matrix with shape [rows, hidden_dim]. For each row
- * i and column j:
- *
- *   output[i, j] = input[i, j] * rsqrt(mean(input[i, :]^2) + eps) * weight[j]
- *
- * The output vector is preallocated with rows * hidden_dim elements.
- *
- * @tparam T Data type of input, weight, and output tensors.
- * @param[in] h_input Flattened input matrix of shape [rows, hidden_dim].
- * @param[in] h_weight Per-column scale vector of shape [hidden_dim].
- * @param[out] h_output Flattened output matrix of shape [rows, hidden_dim].
- * @param[in] rows Number of rows/tokens.
- * @param[in] hidden_dim Size of the normalized dimension.
- * @param[in] eps Numerical stability epsilon.
- */
+// ===================== 设备端类型转换 =====================
 template <typename T>
-void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
-              std::vector<T>& h_output, size_t rows, size_t hidden_dim,
-              float eps) {
-  // TODO: Implement the rmsNorm function
+__device__ inline float dev_to_float(T val) {
+    return static_cast<float>(val);
+}
+template <>
+__device__ inline float dev_to_float<half>(half val) {
+    return __half2float(val);
 }
 
-/**
- * @brief Computes flash attention for given query, key, and value tensors.
- * 
- * @tparam T Data type (float) for input/output tensors
- * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] batch_size Batch dimension size
- * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
- * @param[in] query_heads Number of query attention heads
- * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
- * @param[in] head_dim Dimension size of each attention head
- * @param[in] is_causal Whether to apply causal masking
- */
+template <typename T>
+__device__ inline T dev_from_float(float val) {
+    return static_cast<T>(val);
+}
+template <>
+__device__ inline half dev_from_float<half>(float val) {
+    return __float2half(val);
+}
+
+// ===================== RMSNorm 内核 =====================
+template <typename T>
+__global__ void rmsNormKernel(const T* input, const T* weight, T* output,
+                              size_t rows, size_t hidden_dim, float eps) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    float sum = 0.0f;
+
+    // 每个线程累加自己负责的列
+    for (size_t col = tid; col < hidden_dim; col += num_threads) {
+        float val = dev_to_float(input[row * hidden_dim + col]);
+        sum += val * val;
+    }
+
+    extern __shared__ float smem[];
+    smem[tid] = sum;
+    __syncthreads();
+
+    // 树形归约
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            smem[tid] += smem[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    // 计算 RMS 并广播
+    if (tid == 0) {
+        smem[0] = sqrtf(smem[0] / hidden_dim + eps);
+    }
+    __syncthreads();
+
+    float rms = smem[0];
+
+    // 归一化并写回
+    for (size_t col = tid; col < hidden_dim; col += num_threads) {
+        float val = dev_to_float(input[row * hidden_dim + col]);
+        float w = dev_to_float(weight[col]);
+        output[row * hidden_dim + col] = dev_from_float<T>(val * w / rms);
+    }
+}
+
+// ===================== Flash Attention 内核 =====================
+template <typename T>
+__global__ void flashAttentionKernel(
+    const T* __restrict__ q,
+    const T* __restrict__ k,
+    const T* __restrict__ v,
+    T* __restrict__ o,
+    int batch_size,
+    int target_seq_len,
+    int src_seq_len,
+    int query_heads,
+    int kv_heads,
+    int head_dim,
+    bool is_causal,
+    int groups,
+    int Br,
+    int Bc) {
+
+    extern __shared__ float smem[];
+    float* smem_k = smem;
+    float* smem_v = smem + Bc * head_dim;
+
+    int total_q_blocks = (target_seq_len + Br - 1) / Br;
+    int blocks_per_head = total_q_blocks;
+    int blocks_per_batch = query_heads * blocks_per_head;
+
+    int block_id = blockIdx.x;
+    int b = block_id / blocks_per_batch;
+    int rem = block_id % blocks_per_batch;
+    int qh = rem / blocks_per_head;
+    int q_start = (rem % blocks_per_head) * Br;
+
+    int tid = threadIdx.x;
+    int i = tid;
+    bool valid_row = (i < min(Br, target_seq_len - q_start));
+    int q_len = min(Br, target_seq_len - q_start);
+    int global_i = q_start + i;
+    int kv_h = qh / groups;
+
+    // Q 行加载到寄存器
+    float q_reg[256];
+    if (valid_row) {
+        int q_base = ((b * target_seq_len + global_i) * query_heads + qh) * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            q_reg[d] = dev_to_float<T>(q[q_base + d]);
+        }
+    }
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float O[256] = {0.0f};
+    float scale = rsqrtf((float)head_dim);
+
+    for (int kv_start = 0; kv_start < src_seq_len; kv_start += Bc) {
+        int kv_len = min(Bc, src_seq_len - kv_start);
+
+        // 协作加载 K/V 到共享内存
+        for (int idx = tid; idx < kv_len * head_dim; idx += blockDim.x) {
+            int j = idx / head_dim;
+            int d = idx % head_dim;
+            int global_j = kv_start + j;
+            int k_idx = ((b * src_seq_len + global_j) * kv_heads + kv_h) * head_dim + d;
+            int v_idx = ((b * src_seq_len + global_j) * kv_heads + kv_h) * head_dim + d;
+            smem_k[j * head_dim + d] = dev_to_float<T>(k[k_idx]);
+            smem_v[j * head_dim + d] = dev_to_float<T>(v[v_idx]);
+        }
+        __syncthreads();
+
+        if (valid_row) {
+            // 第一遍：当前块内最大值
+            float row_max = -INFINITY;
+            for (int j = 0; j < kv_len; ++j) {
+                int global_j = kv_start + j;
+                if (is_causal && global_j > global_i) continue;
+                float s = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    s += q_reg[d] * smem_k[j * head_dim + d];
+                }
+                s *= scale;
+                if (s > row_max) row_max = s;
+            }
+
+            if (row_max != -INFINITY) {
+                // 第二遍：计算指数和
+                float sum_exp = 0.0f;
+                for (int j = 0; j < kv_len; ++j) {
+                    int global_j = kv_start + j;
+                    if (is_causal && global_j > global_i) continue;
+                    float s = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        s += q_reg[d] * smem_k[j * head_dim + d];
+                    }
+                    s *= scale;
+                    sum_exp += expf(s - row_max);
+                }
+
+                // 更新全局统计量
+                float m_old = m;
+                float l_old = l;
+                float m_new = fmaxf(m_old, row_max);
+                float l_new = l_old * expf(m_old - m_new) + sum_exp * expf(row_max - m_new);
+
+                float scale_o = (l_old / l_new) * expf(m_old - m_new);
+                for (int d = 0; d < head_dim; ++d) {
+                    O[d] *= scale_o;
+                }
+
+                // 第三遍：累加 V 贡献
+                for (int j = 0; j < kv_len; ++j) {
+                    int global_j = kv_start + j;
+                    if (is_causal && global_j > global_i) continue;
+                    float s = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        s += q_reg[d] * smem_k[j * head_dim + d];
+                    }
+                    s *= scale;
+                    float p = expf(s - m_new) / l_new;
+                    for (int d = 0; d < head_dim; ++d) {
+                        O[d] += p * smem_v[j * head_dim + d];
+                    }
+                }
+
+                m = m_new;
+                l = l_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    // 写回输出
+    if (valid_row) {
+        int o_base = ((b * target_seq_len + global_i) * query_heads + qh) * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            o[o_base + d] = dev_from_float<T>(O[d]);
+        }
+    }
+}
+
+// ===================== 主机端 RMSNorm 接口 =====================
+template <typename T>
+void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
+             std::vector<T>& h_output, size_t rows, size_t hidden_dim,
+             float eps) {
+    size_t input_size = rows * hidden_dim;
+    T *d_input, *d_weight, *d_output;
+
+    mcMalloc(&d_input, input_size * sizeof(T));
+    mcMalloc(&d_weight, hidden_dim * sizeof(T));
+    mcMalloc(&d_output, input_size * sizeof(T));
+
+    mcMemcpy(d_input, h_input.data(), input_size * sizeof(T), mcMemcpyHostToDevice);
+    mcMemcpy(d_weight, h_weight.data(), hidden_dim * sizeof(T), mcMemcpyHostToDevice);
+
+    // 每个 block 处理一行，block 大小取 256（兼顾寄存器与 occupancy）
+    int block_size = 256;
+    int grid_size = rows;
+    size_t shmem_bytes = block_size * sizeof(float);
+
+    rmsNormKernel<T><<<grid_size, block_size, shmem_bytes>>>(
+        d_input, d_weight, d_output, rows, hidden_dim, eps);
+
+    mcDeviceSynchronize();
+
+    mcMemcpy(h_output.data(), d_output, input_size * sizeof(T), mcMemcpyDeviceToHost);
+
+    mcFree(d_input);
+    mcFree(d_weight);
+    mcFree(d_output);
+}
+
+// ===================== 主机端 Flash Attention 接口 =====================
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+    // 确保 head_dim 不超过寄存器数组大小（可调整）
+    assert(head_dim <= 256);
+
+    size_t q_size = (size_t)batch_size * target_seq_len * query_heads * head_dim;
+    size_t kv_size = (size_t)batch_size * src_seq_len * kv_heads * head_dim;
+    size_t o_size = q_size;
+
+    T *d_q, *d_k, *d_v, *d_o;
+    mcMalloc(&d_q, q_size * sizeof(T));
+    mcMalloc(&d_k, kv_size * sizeof(T));
+    mcMalloc(&d_v, kv_size * sizeof(T));
+    mcMalloc(&d_o, o_size * sizeof(T));
+
+    mcMemcpy(d_q, h_q.data(), q_size * sizeof(T), mcMemcpyHostToDevice);
+    mcMemcpy(d_k, h_k.data(), kv_size * sizeof(T), mcMemcpyHostToDevice);
+    mcMemcpy(d_v, h_v.data(), kv_size * sizeof(T), mcMemcpyHostToDevice);
+
+    const int Br = 128;
+    int Bc;
+    size_t max_shmem = 49152;                // 共享内存大小（典型值）
+    Bc = (int)(max_shmem / (2 * head_dim * sizeof(float)));
+    Bc = std::max(1, std::min(Bc, 64));
+    Bc = std::min(Bc, src_seq_len);
+    Bc = (Bc / 4) * 4;
+    if (Bc == 0) Bc = 4;
+
+    int total_q_blocks = (target_seq_len + Br - 1) / Br;
+    int blocks_per_batch = query_heads * total_q_blocks;
+    int grid_size = batch_size * blocks_per_batch;
+    dim3 block(Br, 1, 1);
+    dim3 grid(grid_size, 1, 1);
+
+    size_t shmem_bytes = (size_t)2 * Bc * head_dim * sizeof(float);
+
+    flashAttentionKernel<T><<<grid, block, shmem_bytes>>>(
+        d_q, d_k, d_v, d_o,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim,
+        is_causal,
+        query_heads / kv_heads,
+        Br, Bc
+    );
+
+    mcDeviceSynchronize();
+
+    mcMemcpy(h_o.data(), d_o, o_size * sizeof(T), mcMemcpyDeviceToHost);
+
+    mcFree(d_q);
+    mcFree(d_k);
+    mcFree(d_v);
+    mcFree(d_o);
 }
 
-// *********************************************************************
-// Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
-// DO NOT MODIFY THIS SECTION
-// *********************************************************************
+// ===================== 显式模板实例化（与 tester 链接必须） =====================
 template void rmsNorm<float>(const std::vector<float>&, const std::vector<float>&,
-  std::vector<float>&, size_t, size_t, float);
+                             std::vector<float>&, size_t, size_t, float);
 template void rmsNorm<half>(const std::vector<half>&, const std::vector<half>&,
-  std::vector<half>&, size_t, size_t, float);
+                            std::vector<half>&, size_t, size_t, float);
 template void flashAttention<float>(const std::vector<float>&, const std::vector<float>&,
-  const std::vector<float>&, std::vector<float>&,
-  int, int, int, int, int, int, bool);
+                                    const std::vector<float>&, std::vector<float>&,
+                                    int, int, int, int, int, int, bool);
 template void flashAttention<half>(const std::vector<half>&, const std::vector<half>&,
-  const std::vector<half>&, std::vector<half>&,
-  int, int, int, int, int, int, bool);
+                                   const std::vector<half>&, std::vector<half>&,
+                                   int, int, int, int, int, int, bool);
